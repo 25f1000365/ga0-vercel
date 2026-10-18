@@ -191,7 +191,9 @@ Return ONLY a JSON object with these keys:
 
 Metric meanings: %s
 Revenue always means paid orders only. "How many orders" without a status means orders of any status unless the question says paid/completed/refunded/cancelled(void).
-Units sold / quantity sold means units of paid orders."""
+Units sold / quantity sold means units of paid orders.
+"How many different/unique/distinct customers ..." -> metric distinct_customers with group_by null (it asks for a count, not a name).
+"at least one" is NOT a ranking word. Only use group_by when the question asks WHICH/WHO/top/best/highest/lowest among regions/products/customers/months."""
 
 
 def _llm_query(question):
@@ -233,11 +235,11 @@ def _rule_query(question):
             q["metric"] = "refund_rate_pct"
     elif re.search(r"\bunits?\b|quantity|items sold|how many .* sold", t):
         q["metric"] = "units"
-    elif re.search(r"how many (distinct |unique |different )?customers|number of customers", t):
+    elif re.search(r"(how many|count|number of|count of)( the)? (distinct |unique |different )?customers", t):
         q["metric"] = "distinct_customers"
     elif re.search(r"average order|aov|average .*per order", t):
         q["metric"] = "avg_order_value_usd"
-    elif re.search(r"how many orders|number of orders|order count", t):
+    elif re.search(r"how many (\w+ )?orders|number of (\w+ )?orders|order count|count of (\w+ )?orders", t):
         q["metric"] = "order_count"
         for s in STATUSES:
             if s in t:
@@ -255,19 +257,51 @@ def _rule_query(question):
         if w == "may" and not re.search(r"\bmay\s+20\d\d|\b(in|of|during|for) may\b", t):
             continue  # "may" is usually the verb
         mm.append(MONTHS[w])
+    t = re.sub(r"\bfirst quarter\b", "q1", t)
+    t = re.sub(r"\bsecond quarter\b", "q2", t)
+    t = re.sub(r"\bthird quarter\b", "q3", t)
+    t = re.sub(r"\bfourth quarter\b", "q4", t)
+    if re.search(r"\b(first half|h1)\b", t):
+        mm = [1, 6]
     if (m := re.search(r"\bq([1-4])\b", t)):
         a = (int(m.group(1)) - 1) * 3 + 1
         q["date_from"], q["date_to"] = f"{year}-{a:02d}-01", f"{year}-{a+2:02d}-{calendar.monthrange(year, a+2)[1]}"
     elif mm:
         a, b = min(mm), max(mm)
         q["date_from"], q["date_to"] = f"{year}-{a:02d}-01", f"{year}-{b:02d}-{calendar.monthrange(year, b)[1]}"
-    if re.search(r"\bwhich\b|\bwhat (region|product|customer|month)\b|top|best|highest|most|lowest|least", t):
+    tg = re.sub(r"\bat (least|most)\b", " ", t)  # "at least one order" is not a ranking
+    asks_count = re.match(r"\s*(how many|how much|what (is|was) the (total|number|sum|average|count))", tg)
+    m = re.search(r"\b(which|what|name the|identify the)\s+(\w+\s+)?(region|product|customer|month)", tg)
+    rank = re.search(r"\b(top|best|biggest|largest|highest|most|lowest|least|worst|smallest|fewest)\b", tg)
+    group = None
+    if m:
+        group = m.group(3)
+    elif rank and not asks_count:
         for g in ("product", "region", "customer", "month"):
-            if re.search(r"\b" + g, t):
-                q["group_by"] = g
-                q["order"] = "asc" if re.search(r"lowest|least|worst|fewest", t) else "desc"
-                q["return"] = "key"
+            if re.search(r"\b" + g, tg):
+                group = g
                 break
+    elif rank and asks_count:
+        # e.g. "How much did the top customer spend?" -> value of the top group
+        for g in ("product", "region", "customer", "month"):
+            if re.search(r"\b(top|best|biggest|largest|highest|lowest|worst|smallest)\s+(\w+\s+)?" + g, tg):
+                group = g
+                q["return"] = "value"
+                break
+    if group:
+        q["group_by"] = group
+        q["order"] = "asc" if re.search(r"\b(lowest|least|worst|fewest|smallest)\b", tg) else "desc"
+        q.setdefault("return", "key")
+        # what are we ranking by?
+        if re.search(r"\bunits?\b|quantity|most sold|best[- ]selling|sold the most", tg) and q["metric"] == "revenue_usd":
+            q["metric"] = "units"
+        if re.search(r"\b(most|fewest|number of|count of) (\w+ )?orders\b", tg) and q["metric"] == "revenue_usd":
+            q["metric"] = "order_count"
+            q["statuses"] = ["paid"] if "paid" in tg else None
+    if group == "customer" and q["metric"] == "distinct_customers":
+        q["metric"] = "revenue_usd"
+    if q["metric"] in ("order_count", "units", "distinct_customers", "avg_order_value_usd") and "paid" in tg:
+        q["statuses"] = ["paid"]
     return q
 
 
@@ -280,6 +314,10 @@ def answer(question):
     source = "llm" if q else "rules"
     if not q:
         q = _rule_query(question)
+    # A "how many / how much" question wants a number, never a name
+    if q.get("group_by") and q.get("return", "key") == "key" and \
+            re.match(r"\s*(how many|how much)", question.lower()):
+        q["group_by"] = None
     result = run_query(q)
     print(json.dumps({"question": question, "source": source, "query": q, "answer": result}, default=str))
     return result, q, source
