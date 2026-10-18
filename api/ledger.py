@@ -224,20 +224,40 @@ MONTHS = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
 MONTHS.update({m.lower(): i for i, m in enumerate(calendar.month_abbr) if m})
 
 
+def _explicit_days(t, year):
+    """Dates like 2026-03-15, 15 March 2026, March 15, 2026, 15/03/2026."""
+    out = []
+    for y, m, d in re.findall(r"\b(20\d\d)-(\d\d)-(\d\d)\b", t):
+        out.append(dt.date(int(y), int(m), int(d)))
+    names = "|".join(sorted(MONTHS, key=len, reverse=True))
+    for d, mon, y in re.findall(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(" + names + r")\.?,?\s*(20\d\d)?\b", t):
+        out.append(dt.date(int(y or year), MONTHS[mon], int(d)))
+    for mon, d, y in re.findall(r"\b(" + names + r")\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b,?\s*(20\d\d)?", t):
+        if int(d) <= 31:
+            out.append(dt.date(int(y or year), MONTHS[mon], int(d)))
+    for d, m, y in re.findall(r"\b(\d{1,2})/(\d{1,2})/(20\d\d)\b", t):
+        out.append(dt.date(int(y), int(m), int(d)))
+    return out
+
+
 def _rule_query(question):
     t = question.lower()
     q = {"metric": "revenue_usd"}
-    if "refund" in t:
+    if re.search(r"\bnet\b", t) and re.search(r"revenue|sales|income", t):
+        q["metric"] = "net_usd"
+    elif "refund" in t:
         q["metric"] = "refunded_usd" if re.search(r"amount|value|usd|\$|total|how much|sum", t) else "order_count"
         if q["metric"] == "order_count":
             q["statuses"] = ["refunded"]
         if "rate" in t or "percent" in t or "%" in t:
             q["metric"] = "refund_rate_pct"
-    elif re.search(r"\bunits?\b|quantity|items sold|how many .* sold", t):
+    elif re.search(r"\bunits?\b|quantity|items sold|how many .* sold", t) and not re.search(r"\b(average|mean|avg)\b", t):
         q["metric"] = "units"
     elif re.search(r"(how many|count|number of|count of)( the)? (distinct |unique |different )?customers", t):
         q["metric"] = "distinct_customers"
-    elif re.search(r"average order|aov|average .*per order", t):
+    elif re.search(r"\b(average|mean|avg)\b.*\b(units?|qty|quantity|items)\b.*\b(per|in an?|each) (\w+ )?order\b", t):
+        q["metric"] = "avg_units_per_order"
+    elif re.search(r"\b(average|mean|avg)\b(\s+\w+)?\s+(order|ticket|basket|transaction|sale)\b|\baov\b|\b(average|mean|avg)\b.*\bper order\b|\b(average|mean|avg)\b.*\b(order|transaction) (value|size|amount)\b", t):
         q["metric"] = "avg_order_value_usd"
     elif re.search(r"how many (\w+ )?orders|number of (\w+ )?orders|order count|count of (\w+ )?orders", t):
         q["metric"] = "order_count"
@@ -257,13 +277,19 @@ def _rule_query(question):
         if w == "may" and not re.search(r"\bmay\s+20\d\d|\b(in|of|during|for) may\b", t):
             continue  # "may" is usually the verb
         mm.append(MONTHS[w])
+    days = _explicit_days(t, year)
+    if days:
+        q["date_from"], q["date_to"] = min(days).isoformat(), max(days).isoformat()
+        mm = []
     t = re.sub(r"\bfirst quarter\b", "q1", t)
     t = re.sub(r"\bsecond quarter\b", "q2", t)
     t = re.sub(r"\bthird quarter\b", "q3", t)
     t = re.sub(r"\bfourth quarter\b", "q4", t)
     if re.search(r"\b(first half|h1)\b", t):
         mm = [1, 6]
-    if (m := re.search(r"\bq([1-4])\b", t)):
+    if days:
+        pass
+    elif (m := re.search(r"\bq([1-4])\b", t)):
         a = (int(m.group(1)) - 1) * 3 + 1
         q["date_from"], q["date_to"] = f"{year}-{a:02d}-01", f"{year}-{a+2:02d}-{calendar.monthrange(year, a+2)[1]}"
     elif mm:
@@ -292,6 +318,9 @@ def _rule_query(question):
         q["group_by"] = group
         q["order"] = "asc" if re.search(r"\b(lowest|least|worst|fewest|smallest)\b", tg) else "desc"
         q.setdefault("return", "key")
+        if (mt := re.search(r"\b(top|bottom|best|worst)\s+(\d+|two|three|four|five)\b", tg)):
+            words = {"two": 2, "three": 3, "four": 4, "five": 5}
+            q["top_n"] = int(words.get(mt.group(2), mt.group(2)))
         # what are we ranking by?
         if re.search(r"\bunits?\b|quantity|most sold|best[- ]selling|sold the most", tg) and q["metric"] == "revenue_usd":
             q["metric"] = "units"
