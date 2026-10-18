@@ -10,7 +10,24 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def force_cors(request: Request, call_next):
+    # Always send CORS headers (even with no Origin header or on errors),
+    # and expose them so browser-side graders can read them.
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        from fastapi.responses import JSONResponse
+        response = JSONResponse({"error": str(e)}, status_code=500)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Expose-Headers"] = "*"
+    return response
 
 DATA = [
     {"region": "apac", "service": "support", "latency_ms": 176.58, "uptime_pct": 97.581, "timestamp": 20250301},
@@ -76,6 +93,151 @@ def metrics(regions: List[str], threshold: float) -> dict:
             "breaches": sum(1 for x in lat if x > threshold),
         }
     return out
+
+
+# =====================================================================
+# GA1 Q6: 12-factor config precedence  ->  GET /effective-config
+# =====================================================================
+CFG_DEFAULTS = {"port": 8000, "workers": 1, "debug": False, "log_level": "info",
+                "api_key": "default-secret-000"}
+CFG_YAML = {"workers": 11, "debug": False, "log_level": "info"}          # config.development.yaml
+CFG_DOTENV = {"APP_PORT": "8638", "NUM_WORKERS": "13", "APP_DEBUG": "true",
+              "APP_LOG_LEVEL": "debug"}                                  # .env file
+CFG_OSENV = {"APP_PORT": "8256", "APP_DEBUG": "true", "APP_LOG_LEVEL": "info"}  # OS env vars
+
+ENV_ALIASES = {"NUM_WORKERS": "workers"}
+
+
+def env_to_key(name: str):
+    if name in ENV_ALIASES:
+        return ENV_ALIASES[name]
+    if name.startswith("APP_"):
+        k = name[4:].lower()
+        return "workers" if k in ("workers", "num_workers") else k
+    return None
+
+
+def coerce(key: str, value):
+    if key in ("port", "workers"):
+        return int(str(value).strip())
+    if key == "debug":
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("true", "1", "yes", "on")
+    return value if isinstance(value, str) else str(value)
+
+
+@app.get("/effective-config")
+async def effective_config(request: Request):
+    cfg = dict(CFG_DEFAULTS)
+    cfg.update(CFG_YAML)
+    for layer in (CFG_DOTENV, CFG_OSENV):
+        for name, val in layer.items():
+            k = env_to_key(name)
+            if k:
+                cfg[k] = val
+    for item in request.query_params.getlist("set"):
+        if "=" in item:
+            k, v = item.split("=", 1)
+            k = k.strip()
+            k = ENV_ALIASES.get(k, k)
+            if k.upper().startswith("APP_"):
+                k = env_to_key(k.upper())
+            cfg[k.lower()] = v
+    out = {}
+    for k, v in cfg.items():
+        try:
+            out[k] = coerce(k, v)
+        except ValueError:
+            out[k] = v
+    out["api_key"] = "****"
+    return out
+
+
+# =====================================================================
+# GA1 Q14: live MCP server  ->  POST /mcp
+# =====================================================================
+import hashlib
+import json as _json
+import uuid
+from fastapi.responses import JSONResponse
+
+MCP_EMAIL = "25f1000365@ds.study.iitm.ac.in".strip().lower()
+MCP_TOOL = {
+    "name": "solve_challenge",
+    "description": "Returns the first 16 hex chars of SHA-256(challenge:email), "
+                   "using the X-Exam-Challenge request header.",
+    "inputSchema": {"type": "object", "properties": {}, "required": []},
+}
+
+
+def mcp_result(msg_id, result):
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+
+def mcp_error(msg_id, code, message):
+    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
+
+
+def mcp_handle(msg: dict, request: Request):
+    method = msg.get("method")
+    msg_id = msg.get("id")
+    if msg_id is None:  # notification (e.g. notifications/initialized)
+        return None
+    if method == "initialize":
+        params = msg.get("params") or {}
+        return mcp_result(msg_id, {
+            "protocolVersion": params.get("protocolVersion", "2025-03-26"),
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "tds-ga1-mcp", "version": "1.0.0"},
+        })
+    if method == "ping":
+        return mcp_result(msg_id, {})
+    if method == "tools/list":
+        return mcp_result(msg_id, {"tools": [MCP_TOOL]})
+    if method == "tools/call":
+        name = (msg.get("params") or {}).get("name")
+        if name != "solve_challenge":
+            return mcp_error(msg_id, -32602, f"Unknown tool: {name}")
+        challenge = request.headers.get("x-exam-challenge", "")
+        text = hashlib.sha256(f"{challenge}:{MCP_EMAIL}".encode()).hexdigest()[:16]
+        return mcp_result(msg_id, {"content": [{"type": "text", "text": text}], "isError": False})
+    return mcp_error(msg_id, -32601, f"Method not found: {method}")
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(mcp_error(None, -32700, "Parse error"), status_code=400)
+    session = request.headers.get("mcp-session-id") or uuid.uuid4().hex
+    headers = {"Mcp-Session-Id": session}
+    if isinstance(payload, list):
+        replies = [r for r in (mcp_handle(m, request) for m in payload) if r is not None]
+        if not replies:
+            return Response(status_code=202, headers=headers)
+        return JSONResponse(replies, headers=headers)
+    reply = mcp_handle(payload, request)
+    if reply is None:
+        return Response(status_code=202, headers=headers)
+    return JSONResponse(reply, headers=headers)
+
+
+@app.get("/mcp")
+async def mcp_get():
+    # No server-initiated SSE stream; allowed by the Streamable HTTP spec
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+@app.delete("/mcp")
+async def mcp_delete():
+    return Response(status_code=200)
+
+
+@app.get("/{path:path}")
+async def health(path: str = ""):
+    return {"status": "ok", "hint": "POST {\"regions\": [...], \"threshold_ms\": 180}"}
 
 
 @app.options("/{path:path}")
