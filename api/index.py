@@ -257,6 +257,29 @@ async def mcp_delete():
     return Response(status_code=200)
 
 
+# =====================================================================
+# GA1 Q15: The Ledger Agent  ->  POST /answer  {"question": "..."}
+# =====================================================================
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import ledger  # noqa: E402
+from starlette.concurrency import run_in_threadpool  # noqa: E402
+
+
+@app.post("/answer")
+async def ledger_answer(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    question = str(body.get("question", "")).strip()
+    if not question:
+        return JSONResponse({"error": "send JSON {\"question\": \"...\"}"}, status_code=400)
+    result, _query, _source = await run_in_threadpool(ledger.answer, question)
+    return {"answer": result}
+
+
 @app.get("/{path:path}")
 async def health(request: Request, path: str = ""):
     return {"status": "ok", "version": "ga1-v2", "path_seen": request.url.path,
