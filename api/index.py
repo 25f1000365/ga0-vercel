@@ -29,6 +29,28 @@ async def force_cors(request: Request, call_next):
     response.headers["Access-Control-Expose-Headers"] = "*"
     return response
 
+
+@app.middleware("http")
+async def restore_original_path(request: Request, call_next):
+    # vercel.json rewrites every URL to /api/index?__path=/<original path>.
+    # Put the original path back so routes like /effective-config and /mcp match.
+    from urllib.parse import parse_qsl, urlencode
+    qs = parse_qsl(request.scope.get("query_string", b"").decode(), keep_blank_values=True)
+    orig = None
+    rest = []
+    for k, v in qs:
+        if k == "__path" and orig is None:
+            orig = v
+        else:
+            rest.append((k, v))
+    if orig is not None:
+        if not orig.startswith("/"):
+            orig = "/" + orig
+        request.scope["path"] = orig
+        request.scope["raw_path"] = orig.encode()
+        request.scope["query_string"] = urlencode(rest, doseq=True).encode()
+    return await call_next(request)
+
 DATA = [
     {"region": "apac", "service": "support", "latency_ms": 176.58, "uptime_pct": 97.581, "timestamp": 20250301},
     {"region": "apac", "service": "checkout", "latency_ms": 187.92, "uptime_pct": 97.516, "timestamp": 20250302},
@@ -236,8 +258,9 @@ async def mcp_delete():
 
 
 @app.get("/{path:path}")
-async def health(path: str = ""):
-    return {"status": "ok", "hint": "POST {\"regions\": [...], \"threshold_ms\": 180}"}
+async def health(request: Request, path: str = ""):
+    return {"status": "ok", "version": "ga1-v2", "path_seen": request.url.path,
+            "hint": "POST {\"regions\": [...], \"threshold_ms\": 180}"}
 
 
 @app.options("/{path:path}")
